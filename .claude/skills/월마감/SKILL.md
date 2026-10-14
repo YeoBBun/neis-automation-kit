@@ -20,6 +20,11 @@ description: 한 달 학생 출결을 나이스와 맞추고 일마감·월마�
 | 4 근태 쓰기 | `.\.venv\Scripts\python.exe -X utf8 geuntae.py 2026-10 --write` | «✅ … 모두 머리글과 맞습니다» |
 | 5 인쇄 | `.\.venv\Scripts\python.exe -X utf8 print_month.py 2026-10 --print` | printed 3개 · 선생님께 «몇 장 나왔는지» 확인 |
 
+**출결 앱을 쓰는 선생님** (구글 캘린더 없음): 1단계를 이렇게 바꾼다 —
+선생님께 앱에서 «그 달 1일~말일» 로 나이스 파일을 받아 달라고 한 뒤
+`.\.venv\Scripts\python.exe -X utf8 app_to_neis.py --대조` (빠짐이 있으면 `app_to_neis.py` 로 넣고 다시 대조).
+2단계는 같다. 3·4단계(근태 색인 목록)는 구글 캘린더를 읽으므로 **출결 앱 방식에서는 아직 안 된다** — 건너뛰고 그렇게 말씀드린다.
+
 - 그 달 마지막 평일 전이면 2단계가 스스로 멈춘다. 억지로 `--force` 를 붙이지 않는다 (선생님이 원하실 때만)
 - 3단계의 ⚠️ 줄(겹침·나이스와 다름·추정)은 하나씩 짚어 드린다
 - 한글 파일은 **geuntae.py 로만** 고친다. 한글 MCP 의 replace/fill 은 .hwp 를 깨뜨린다

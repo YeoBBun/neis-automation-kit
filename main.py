@@ -225,6 +225,7 @@ def build_task_map(records: list[dict]) -> dict[date, list[dict]]:
                 "jongryu": att[1],
                 "note":    rec["note"],
                 "label":   rec["att_type"],
+                "memo":    rec.get("memo", ""),   # 나이스 「사유」 칸 (출결 앱 파일에만 있다)
             }
             # 같은 학생이라도 분류가 다르면 둘 다 입력 (예: 같은 날 지각+조퇴)
             # — 완전히 동일한 (학생, 분류) 건만 하나로 합친다
@@ -743,8 +744,8 @@ async def click_magam_cell(page: Page, name: str, number: str, col: int = 2):
     await cell.click(timeout=5000)
 
 
-async def handle_magam_popup(page: Page, gubun: str, jongryu: str):
-    """팝업 열리면 구분/종류 선택 후 적용."""
+async def handle_magam_popup(page: Page, gubun: str, jongryu: str, memo: str = ""):
+    """팝업 열리면 구분/종류 선택 (+ memo 가 있으면 사유) 후 적용."""
     await page.wait_for_selector("text=출결마감구분", timeout=10_000)
     await page.wait_for_timeout(200)
 
@@ -756,7 +757,16 @@ async def handle_magam_popup(page: Page, gubun: str, jongryu: str):
     await page.get_by_role("radio", name=jongryu).click()
     await page.wait_for_timeout(200)
 
-    # 사유란은 개인정보 우려로 입력하지 않음 (비워둠)
+    # 사유 — 캘린더 방식은 memo 가 없어 예전처럼 비워 둔다. 출결 앱 파일은 상세 사유를 넘긴다.
+    # ⚠️ 화면에는 aria-label="사유" 칸이 둘 보인다 (2026-10-14 실측) — 이 팝업 안으로 좁힌다.
+    if memo:
+        dialog = page.locator(".cl-dialog-wrapper:visible").filter(has_text="출결마감구분").last
+        sayu = dialog.locator('input[aria-label="사유"]')
+        await sayu.click(timeout=5000)
+        await page.keyboard.press("Control+A")
+        await page.keyboard.press("Delete")
+        await sayu.press_sequentially(memo, delay=30)
+        await page.wait_for_timeout(200)
 
     # 적용
     await page.locator("a").filter(has_text=re.compile(r"^적용$")).click()
@@ -821,7 +831,7 @@ async def enter_student(page: Page, task: dict, day_cols=None) -> tuple[str, str
     try:
         # 1단계: 항상 마감(col=2) 셀 클릭 → 구분/종류 팝업 → 적용
         await click_magam_cell(page, name, number, col=2)
-        await handle_magam_popup(page, gubun, jongryu)
+        await handle_magam_popup(page, gubun, jongryu, task.get("memo", ""))
         applied = True   # 여기까지 왔으면 구분·종류는 화면에 들어갔다
 
         if jongryu in ("조퇴", "지각"):
@@ -1061,6 +1071,65 @@ async def save_page(page: Page) -> tuple[str, str]:
     return _judge_save(body, told)
 
 
+async def _day_matches(page: Page, tasks: list[dict]) -> bool:
+    """그날 화면에서 각 학생 행의 «마감» 칸(데이터 행 index 3 — verify_attendance.IDX 와 같다)이
+    넣으려던 구분·종류를 담고 있는지. 한 명이라도 못 찾거나 다르면 False."""
+    cells = await page.evaluate(r"""() => {
+      const o = {};
+      for (const r of document.querySelectorAll('.cl-grid-row')) {
+        const k = r.children;
+        if (k.length > 3) o[(k[0].innerText || '').trim()] = (k[3].innerText || '').trim();
+      }
+      return o;
+    }""")
+    for t in tasks:
+        got = cells.get(str(t["number"]), "")
+        if t["gubun"] not in got or t["jongryu"] not in got:
+            return False
+    return True
+
+
+# 출결마감 결과창 성공 문구.
+#   묻는 창 「확인 / 일출결마감을 하시겠습니까?」 → 결과창 「알림 / 마감했습니다.」 (2026-10-14 실측)
+CLOSE_SUCCESS = ("마감했습니다", "마감되었습니다")
+
+
+async def close_day(page: Page) -> tuple[bool, str]:
+    """저장이 끝난 그날을 [출결마감] 한다 (--마감 일 때만). 돌려주는 값: (마감 확인됨?, 이유).
+
+    ⚠️ 마감은 그날 반 전체를 확정한다 — 저장이 확실하고 실패자가 없는 날에만 부른다.
+    묻는 창이 «마감 … 하시겠습니까» 가 아니면 [확인] 을 누르지 않고 멈춘다.
+    """
+    await dismiss_alert_popup(page, timeout=1000)
+    btn = page.get_by_role("button", name="출결마감").filter(visible=True)
+    if await btn.count() == 0:
+        return (False, "[출결마감] 버튼이 안 보입니다")
+    await btn.first.click(timeout=5000)
+    await page.wait_for_timeout(600)
+
+    asked, ask_text = await wait_dialog(page, lambda raw: True, 5000)
+    if asked is None:
+        return (False, "[출결마감] 을 눌렀는데 아무 창도 뜨지 않았습니다")
+    if not ("마감" in ask_text and "하시겠습니까" in ask_text):
+        # 묻는 창이 아니라 바로 결과·경고가 뜬 경우 — 글자만 남기고 판단은 사람에게
+        return (False, f"예상과 다른 창이 떠서 누르지 않았습니다: 「{ask_text[:150]}」")
+    print(f"  ❔  나이스: 「{ask_text[:80]}」 → 확인")
+    if not await click_dialog_confirm(asked):
+        return (False, "마감 확인창의 [확인] 을 못 눌렀습니다")
+    await page.wait_for_timeout(800)
+
+    dialog, body = await wait_dialog(page, lambda raw: not any(w in raw for w in NOT_RESULT_YET), 8000)
+    if dialog is None:
+        return (False, "마감 결과창을 못 봤습니다 — 마감됐는지 나이스에서 확인해 주세요")
+    print(f"  ❔  나이스: 「{body[:80]}」")
+    if any(w in body for w in SAVE_BAD_WORDS) or not any(s in body for s in CLOSE_SUCCESS):
+        return (False, f"마감 결과창이 예상과 다릅니다 (누르지 않음): 「{body[:150]}」")
+    await click_dialog_confirm(dialog)
+    await page.wait_for_timeout(600)
+    print("  🔒  출결마감 완료!")
+    return (True, "")
+
+
 # ============================================================
 # 메인
 # ============================================================
@@ -1084,6 +1153,8 @@ async def main():
     allow_future = "--future" in args
     # --dry-run: 무엇을 넣을지 목록만 보여주고 나이스는 열지 않는다
     dry_run = "--dry-run" in args
+    # --마감: 저장이 확실하고 실패자가 없는 날만 [출결마감] 까지 누른다 (선생님이 말할 때만)
+    do_close = "--마감" in args
     date_arg = next((a for a in args if re.match(r"\d{4}-\d{2}-\d{2}", a)), None)
     if date_arg:
         try:
@@ -1144,6 +1215,9 @@ async def main():
 
         failures: list[dict] = []   # 못 들어간 학생 (날짜·갈래·번호·이름·이유)
         exit_code = 0
+        closed: list[date] = []               # --마감 으로 마감한 날
+        not_closed: list[tuple[date, str]] = []  # --마감 인데 마감하지 않은 날과 이유
+        close_stopped = False                 # 예상과 다른 창이 뜨면 그 뒤로는 아무것도 하지 않는다
 
         try:
             await page.goto(NEIS_URL)
@@ -1199,7 +1273,41 @@ async def main():
                             continue
                         failures.append(_failure(d, UNSURE, task, save_reason))
 
+                if do_close:
+                    # 「변경된 내용이 없습니다」 = 이미 넣어 둔 날일 수 있다. 화면 마감 칸이 넣으려던 것과
+                    # 전부 같으면 저장된 것으로 보고 마감한다. 하나라도 다르면 마감하지 않는다.
+                    if (save_status != SAVE_OK and "변경된 내용이 없습니다" in save_reason
+                            and await _day_matches(page, tasks)):
+                        print("  ✅  화면의 마감 칸이 넣으려던 출결과 모두 같습니다 — 저장된 것으로 봅니다")
+                        failures = [f for f in failures if not (f["date"] == d and f["kind"] == UNSURE)]
+                        save_status = SAVE_OK
+                    if save_status != SAVE_OK or any(f["date"] == d for f in failures):
+                        not_closed.append((d, "저장이 확실하지 않거나 못 들어간 학생이 있어 마감하지 않음"))
+                        continue
+                    ok, why = await close_day(page)
+                    if ok:
+                        closed.append(d)
+                    else:
+                        not_closed.append((d, why))
+                        print(f"  ⛔  {d.strftime('%m/%d')} 마감 못 함 — {why}")
+                        print("      나머지 날짜는 손대지 않고 멈춥니다.")
+                        close_stopped = True
+                        break
+
             exit_code = report_failures(failures)
+            if do_close:
+                print(f"\n🔒  출결마감: {len(closed)}일 마감 "
+                      + (f"({', '.join(x.strftime('%m/%d') for x in closed)})" if closed else ""))
+                for x, why in not_closed:
+                    print(f"  ⏸  {x.strftime('%m/%d')} 마감 안 함 — {why}")
+                if not_closed:
+                    exit_code = 1
+            if close_stopped:
+                print("\n⚠️  예상과 다른 창이 떠 있을 수 있습니다. 브라우저를 10분 동안 열어 둡니다 — 화면을 확인해 주세요.")
+                try:
+                    await page.wait_for_timeout(10 * 60_000)
+                except Exception:
+                    pass   # 선생님이 창을 닫았다
         except Exception as e:
             import traceback
             print(f"\n❌  오류 발생: {e}")

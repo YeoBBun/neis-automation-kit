@@ -12,6 +12,8 @@ neis-automation-kit 의 나이스 입력기(main.py)로 넣는다.
     .\\.venv\\Scripts\\python.exe -X utf8 app_to_neis.py --dry-run     ← 목록만 확인 (나이스 안 엶)
     .\\.venv\\Scripts\\python.exe -X utf8 app_to_neis.py               ← 실제로 넣기
     .\\.venv\\Scripts\\python.exe -X utf8 app_to_neis.py 파일.json     ← 파일을 직접 지정
+    .\\.venv\\Scripts\\python.exe -X utf8 app_to_neis.py --마감        ← 저장 뒤 그날 [출결마감] 까지 (말할 때만)
+    .\\.venv\\Scripts\\python.exe -X utf8 app_to_neis.py --대조        ← 파일과 나이스가 맞는지만 (월마감 1단계, 읽기 전용)
 
 파일을 지정하지 않으면 이 폴더와 「다운로드」 폴더에서 가장 최근의 attendance_neis_*.json 을 쓴다.
 키트의 다른 옵션(--dry-run, --future)은 그대로 넘긴다.
@@ -49,6 +51,7 @@ def load_app_file(path: Path) -> tuple[list[dict], dict]:
             "start_date": d,
             "end_date":   d,
             "note":       r.get("note", ""),
+            "memo":       r.get("memo", ""),   # 상세 사유 → 나이스 「사유」 칸
         })
     return records, data
 
@@ -70,6 +73,11 @@ def main() -> int:
 
     records, data = load_app_file(path)
     print(f"📄  {path.name}  ({data['from']} ~ {data['to']}, {len(records)}건)")
+    with_memo = sum(1 for r in records if r["memo"])
+    if with_memo < len(records):
+        print(f"📝  사유 칸: {with_memo}건은 채우고, {len(records) - with_memo}건은 상세 사유가 없어 비워 둡니다")
+    else:
+        print(f"📝  사유 칸: {with_memo}건 모두 채웁니다")
 
     skipped = data.get("skipped", [])
     if skipped:
@@ -80,6 +88,12 @@ def main() -> int:
 
     # 키트는 캘린더에서 읽는다 — 그 자리에 파일 내용을 넣는다.
     kit.load_from_calendar = lambda start_date, end_date: records
+
+    # --대조: 넣지 않고, 파일과 나이스 화면이 맞는지만 본다 (월마감 1단계). 읽기 전용.
+    if "--대조" in args:
+        import verify_attendance
+        asyncio.run(verify_attendance.run(date.fromisoformat(data["from"]), date.fromisoformat(data["to"])))
+        return 0
 
     # 키트는 날짜를 안 주면 «이번 달 1일부터» 를 넣는다. 파일 기간의 시작일을 넘겨 준다.
     rest = [a for a in args if a != file_arg]
