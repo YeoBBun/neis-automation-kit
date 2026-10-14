@@ -1,13 +1,14 @@
-playwright>=1.45.0
-google-auth>=2.28.0
-google-auth-oauthlib>=1.2.0
-google-api-python-client>=2.120.0
-keyring>=25.0.0
-# mcp 2.x 는 mcp_server.py 가 쓰는 mcp.server.fastmcp(FastMCP 1.x API)를 없앴다.
-# 그냥 mcp>=1.2.0 으로 두면 새로 까는 사람은 2.x 가 깔려 MCP 서버가 뜨지 않는다 (2026-09-16 실측).
-mcp>=1.2.0,<2
-pywinauto>=0.6.8          # 에듀파인 기안기(네이티브 창) — 품의 결재요청
-pillow>=10.0.0            # 기안기 창 캡처 · 월마감 PDF 인쇄
-pyhwpx>=1.7               # 근태 색인 목록(.hwp) 채우기 — 한글 프로그램을 조종한다 (한글 MCP 의 바꾸기는 .hwp 를 깨뜨린다)
-openpyxl>=3.1             # 나이스 월별 출결현황 엑셀 읽기
-pymupdf>=1.24             # 출력물 PDF 를 이름을 댄 프린터로 인쇄
+# 버전은 == 로 고정한다 (2026-10-14). >= 로 두면 설치하는 날의 최신판이 깔려서
+# 새 버전이 깨지거나 오염돼도 그대로 따라 들어온다. 올릴 때는 직접 돌려 보고 숫자를 바꾼다.
+playwright==1.63.0
+google-auth==2.59.1
+google-auth-oauthlib==1.5.0
+google-api-python-client==2.201.0
+keyring==25.7.0
+# mcp 2.x 는 mcp_server.py 가 쓰는 mcp.server.fastmcp(FastMCP 1.x API)를 없앴다 (2026-09-16 실측).
+mcp==1.30.0
+pywinauto==0.6.9          # 에듀파인 기안기(네이티브 창) — 품의 결재요청
+pillow==12.3.0            # 기안기 창 캡처 · 월마감 PDF 인쇄
+pyhwpx==1.7.2             # 근태 색인 목록(.hwp) 채우기 — 한글 프로그램을 조종한다 (한글 MCP 의 바꾸기는 .hwp 를 깨뜨린다)
+openpyxl==3.1.5           # 나이스 월별 출결현황 엑셀 읽기
+pymupdf==1.28.2           # 출력물 PDF 를 이름을 댄 프린터로 인쇄
