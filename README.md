@@ -1,3 +1,15 @@
+> **📌 출결 앱 연동판**
+> 이 저장소는 방배중 안정연 선생님의 [workcalmkite-hue/neis-automation-kit](https://github.com/workcalmkite-hue/neis-automation-kit)
+> 을 포크해, [출결 앱](https://yeobbun.github.io/attendance/)에서 내보낸 파일로 학생 출결을 넣을 수 있게 한 것입니다.
+> 원본 기능은 그대로이고, 추가한 것은 `app_to_neis.py`, `.claude/skills/앱출결/`, `docs/지시서/6_출결앱-연동.md` 뿐입니다.
+>
+> - 출결 앱 → 「출결 기록 → 나이스 파일」 저장 → 클로드에게 **"앱 출결 나이스에 넣어줘"** (`/앱출결`)
+> - 구글 캘린더·구글 열쇠가 필요 없습니다 (설정 마법사 6번에서 n)
+> - 아래 설치 문장은 이 저장소 주소(`https://github.com/YeoBBun/neis-automation-kit`)로 바꿔 두었습니다
+> - 결과는 자동 입력을 지원하지 않아 나이스에서 직접 넣습니다
+
+---
+
 # 교사용 나이스·에듀파인 자동화 키트
 
 **클로드(Claude)에게 말로 시키면 나이스·에듀파인 업무를 대신 해 주는 도구**입니다.
@@ -53,7 +65,7 @@
 6. 아래 입력칸에 **이 문장을 통째로 붙여넣고 엔터**를 칩니다
 
 ```
-https://github.com/workcalmkite-hue/neis-automation-kit 를 지금 열려 있는 이 폴더에 받아줘. 폴더가 비어 있지 않아서 git clone 이 안 되면 git init → git remote add origin → git pull origin main 으로 받아줘. 다 받으면 시작하기.md 를 읽고 거기 적힌 대로 나를 안내해줘.
+https://github.com/YeoBBun/neis-automation-kit 를 지금 열려 있는 이 폴더에 받아줘. 폴더가 비어 있지 않아서 git clone 이 안 되면 git init → git remote add origin → git pull origin main 으로 받아줘. 다 받으면 시작하기.md 를 읽고 거기 적힌 대로 나를 안내해줘.
 ```
 
 받고 나면 **클로드 앱을 완전히 껐다 다시 켜세요.** (권한 설정은 켤 때 한 번만 읽힙니다)
