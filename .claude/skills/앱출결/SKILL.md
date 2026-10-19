@@ -56,6 +56,37 @@ description: 출결 앱(yeobbun.github.io/attendance)에서 내보낸 나이스 
 5. 지우기: `.\.venv\Scripts\python.exe -X utf8 app_to_neis.py --예약해제`
 6. 미리 보기: `--auto --dry-run` (넣지 않고, 파일도 지우지 않는다)
 
+## 휴대폰에서 바로 (자동 연동) ★ 추천
+
+선생님이 «자동 연동 켜줘», «휴대폰에서 누르면 바로 들어가게» 라고 하면 — 휴대폰 앱 「나이스 반영」 을 누르면
+잠긴 파일이 비공개 깃허브 저장소(`YeoBBun/school-attendance-sync`)로 오고, 이 PC 가 몇 분마다 확인해 넣는다.
+
+1. 필요한 부품을 깐다 (잠금 해제용):
+
+   ```powershell
+   .\.venv\Scripts\pip.exe install -r requirements.txt --quiet
+   ```
+
+2. 설정 — **새 창**이 뜬다. 저장소 이름(Enter 면 기본값), 깃허브 토큰, 앱에서 정한 **잠금 비밀번호**를 선생님이 그 창에 직접 친다.
+   토큰·비밀번호를 채팅에 치게 하지 않는다.
+
+   ```powershell
+   .\.venv\Scripts\python.exe -X utf8 app_sync.py --설정
+   ```
+
+3. 확인 (읽기만):  `.\.venv\Scripts\python.exe -X utf8 app_sync.py --확인`
+   — 「연결됨」 이 안 나오면 학교망에서 깃허브 API 가 막혔는지, 토큰 권한(Contents: Read and write, 그 저장소만)을 본다.
+4. 켜기 — 평일 07:30~18:00 에 3분마다 조용히 확인한다 (새 출결이 있을 때만 크롬이 뜬다):
+
+   ```powershell
+   .\.venv\Scripts\python.exe -X utf8 app_sync.py --켜기 3
+   ```
+
+   끄기: `--끄기` · 지금 한 번: `--한번` · 넣지 않고 미리 보기: `--한번 --dry-run`
+5. 동작: 받은 파일을 풀어 나이스에 **저장까지만** 하고(마감 안 함), 결과(건수만, 이름 없음)를 저장소에 올려 휴대폰에 보여주고,
+   받은 파일은 저장소에서 지운다. 미래 날짜는 넣지 않는다. 학생 이름이 든 기록은 `%LOCALAPPDATA%\neis-automation\app_runs\*-sync.log`.
+6. 선생님이 이 PC 에서 나이스를 쓰는 중에 돌면 **자동 로그인 때문에 선생님 세션이 끊길 수 있다** — 처음 며칠은 이 점을 같이 확인한다.
+
 ## 주의
 
 - 학교 밖이면 키트 안내대로 `run_vpn.py` 로 감싼다.

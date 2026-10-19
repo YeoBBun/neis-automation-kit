@@ -58,6 +58,11 @@ def load_app_file(path: Path) -> tuple[list[dict], dict]:
     data = json.loads(path.read_text(encoding="utf-8"))
     if data.get("format") != FORMAT:
         raise SystemExit(f"❌  출결 앱에서 만든 나이스 입력 파일이 아닙니다: {path.name}")
+    return parse_app_data(data), data
+
+
+def parse_app_data(data: dict) -> list[dict]:
+    """앱 파일 내용(dict)을 키트 레코드 목록으로 바꾼다. (깃허브 연동 app_sync.py 도 쓴다)"""
     records = []
     for r in data["records"]:
         d = date.fromisoformat(r["date"])
@@ -70,7 +75,7 @@ def load_app_file(path: Path) -> tuple[list[dict], dict]:
             "note":       r.get("note", ""),
             "memo":       r.get("memo", ""),   # 상세 사유 → 나이스 「사유」 칸
         })
-    return records, data
+    return records
 
 
 # ─── 자동 실행 (작업 스케줄러) ────────────────────────────────

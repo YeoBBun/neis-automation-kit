@@ -5,6 +5,7 @@ google-auth==2.59.1
 google-auth-oauthlib==1.5.0
 google-api-python-client==2.201.0
 keyring==25.7.0
+cryptography==50.0.2     # 출결 앱 연동 — 휴대폰이 잠근 파일 풀기 (app_sync.py)
 # mcp 2.x 는 mcp_server.py 가 쓰는 mcp.server.fastmcp(FastMCP 1.x API)를 없앴다 (2026-09-16 실측).
 mcp==1.30.0
 pywinauto==0.6.9          # 에듀파인 기안기(네이티브 창) — 품의 결재요청
