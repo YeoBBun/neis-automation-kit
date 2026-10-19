@@ -62,7 +62,7 @@ def load_app_file(path: Path) -> tuple[list[dict], dict]:
 
 
 def parse_app_data(data: dict) -> list[dict]:
-    """앱 파일 내용(dict)을 키트 레코드 목록으로 바꾼다. (깃허브 연동 app_sync.py 도 쓴다)"""
+    """앱 파일 내용(dict)을 키트 레코드 목록으로 바꾼다."""
     records = []
     for r in data["records"]:
         d = date.fromisoformat(r["date"])
