@@ -895,7 +895,8 @@ async def _row_restored(page: Page, task: dict, before, timeout_ms: int = 4000) 
     return False
 
 
-async def enter_day(page: Page, d: date, tasks: list[dict], day_cols) -> tuple[list[dict], bool]:
+async def enter_day(page: Page, d: date, tasks: list[dict], day_cols,
+                    prepare=None) -> tuple[list[dict], bool]:
     """그날 학생들을 넣는다. 돌려주는 값: (실패 목록, 저장해도 되는지).
 
     교시 칸에서 실패한 학생(PARTIAL)이 생기면 화면에 «교시 없는 줄» 이 남는다. 나이스는
@@ -907,20 +908,31 @@ async def enter_day(page: Page, d: date, tasks: list[dict], day_cols) -> tuple[l
     ⚠️ 조회가 «됐다고 믿지» 않는다. 실패한 학생 줄이 넣기 전 글자로 돌아온 것을 읽어서
        확인한 뒤에만 다시 넣는다. 확인 못 하면 그날은 저장하지 않는다 (코덱스 검토 2026-09-11 —
        set_date_and_search 는 조회가 거절돼도 True 를 돌려줄 수 있다).
+
+    prepare: 넣기 전에 매번(다시 조회한 뒤에도) 부르는 준비 단계 — 출결 앱 맞추기에서 틀린 줄을
+    지운다(clear_rows). 실패 목록을 돌려주고, 하나라도 있으면 그날은 저장하지 않는다.
     """
     tries: dict[tuple, int] = {}
     last_reason: dict[tuple, str] = {}
     before: dict[tuple, str | None] = {}   # 넣기 전 그 학생 줄 글자 — 지워졌는지 대조용
     while True:
         failures, dirty = [], None
+        # 넣기 전 글자는 «지우기 전» 에 읽어 둔다 — 다시 조회하면 지운 것까지 원래대로 돌아오기 때문
+        for task in tasks:
+            key = (task["number"], task["name"])
+            if key not in before:
+                before[key] = await _row_text(page, task)
+        if prepare is not None:
+            problems = await prepare()
+            if problems:
+                return problems + [_failure(d, FAILED, t, "그날 틀린 줄을 지우지 못해 손대지 않았습니다")
+                                   for t in tasks], False
         for task in tasks:
             key = (task["number"], task["name"])
             if tries.get(key, 0) >= MAX_PARTIAL_TRIES:
                 failures.append(_failure(d, FAILED, task,
                     f"교시 칸에서 {MAX_PARTIAL_TRIES}번 실패해 이 학생만 빼고 저장했습니다 — {last_reason[key]}"))
                 continue
-            if key not in before:
-                before[key] = await _row_text(page, task)
             result = await enter_student(page, task, day_cols)
             if result is None:
                 continue
@@ -1131,6 +1143,188 @@ async def close_day(page: Page) -> tuple[bool, str]:
 
 
 # ============================================================
+# 출결 앱 파일에 맞추기 — 파일이 기준, 나이스에서 다른 줄은 지우고 다시 넣는다
+# ============================================================
+# app_to_neis.py 가 «파일이 책임지는 날짜» 를 넣어 준다. None 이면 예전처럼 넣기만 한다
+# (구글 캘린더 방식은 맞추지 않는다).
+SYNC_DAYS: set[date] | None = None
+
+
+def _same_as_file(task: dict, cells: dict) -> bool:
+    """나이스 그 학생 줄(cells)이 파일의 출결(task) 한 건과 같은지."""
+    if cells.get("마감", "") != f"{task['gubun']}{task['jongryu']}":
+        return False
+    if task["jongryu"] not in ("조퇴", "지각"):
+        return True   # 결석은 분류만 본다
+    import verify_attendance as V
+    marks = {k: v for k, v in cells.items() if k not in ("번호", "성명") and v}
+    return V._check_periods(task["jongryu"], task["note"], marks) is None
+
+
+def plan_sync(tasks: list[dict], grid: dict) -> tuple[list[dict], list[dict]]:
+    """파일(tasks)과 나이스 화면(grid: 번호 → {컬럼: 값})을 견줘 (지울 줄, 넣을 출결) 을 돌려준다.
+
+    - 나이스에만 있는 출결            → 지운다
+    - 분류·교시가 다른 학생          → 지우고 파일대로 다시 넣는다
+    - 나이스에 없는 학생             → 넣는다
+    - 같은 학생                       → 건드리지 않는다
+    같은 학생이 그날 두 건(지각+조퇴)이면 화면 한 칸으로 견줄 수 없어 늘 지우고 다시 넣는다.
+    사유 칸은 견주지 않는다 (화면 표시가 파일 글자와 같은지 실측하지 않았다).
+    """
+    by_num: dict[str, list[dict]] = {}
+    for t in tasks:
+        by_num.setdefault(str(t["number"]), []).append(t)
+    to_clear, to_enter = [], []
+    for num, cells in grid.items():
+        got = cells.get("마감", "")
+        if not got:
+            if num in by_num:
+                to_enter += by_num[num]
+            continue
+        if num in by_num:
+            ts = by_num[num]
+            if len(ts) == 1 and _same_as_file(ts[0], cells):
+                continue
+            to_enter += ts
+        to_clear.append({"number": num, "name": cells.get("성명", ""), "label": "지우기", "was": got})
+    # 화면에서 못 읽은 학생(가상 스크롤 등)은 넣는다 — 예전 방식과 같다
+    to_enter += [t for num, ts in by_num.items() if num not in grid for t in ts]
+    return to_clear, to_enter
+
+
+async def day_is_closed(page: Page) -> bool:
+    """그날이 이미 [출결마감] 됐는지. [마감취소] 는 마감된 날에만 눌린다 (마감 전엔 aria-disabled=true, 2026-10-15 실측)."""
+    btn = page.get_by_role("button", name="마감취소").filter(visible=True)
+    if await btn.count() == 0:
+        return False
+    return (await btn.first.get_attribute("aria-disabled")) != "true"
+
+
+async def reopen_day(page: Page, d: date) -> tuple[bool, str]:
+    """마감된 그날을 [마감취소] 한다 (파일과 달라 고쳐야 할 때만). 돌려주는 값: (풀림 확인됨?, 이유).
+
+    ⚠️ [마감취소] 는 묻지 않고 바로 취소한다 — 뜨는 창은 「알림 / 마감취소 되었습니다. / 확인」 뿐 (2026-10-21 실측).
+       그래도 결과창 «글자» 만 믿지 않고
+       [마감취소] 버튼이 다시 잠겼는지(aria-disabled=true) — 즉 «마감 안 된 날» 로 바뀐 것을 읽어서 판단한다.
+       묻는 창이 «취소 … 하시겠습니까» 가 아니면 [확인] 을 누르지 않고 멈춘다 (close_day 와 같은 원칙).
+    월마감이 돼 있으면 일마감취소가 막힐 수 있다 — 그때는 결과창 글자를 그대로 올리고 멈춘다.
+    """
+    await dismiss_alert_popup(page, timeout=1000)
+    btn = page.get_by_role("button", name="마감취소").filter(visible=True)
+    if await btn.count() == 0:
+        return (False, "[마감취소] 버튼이 안 보입니다")
+    await btn.first.click(timeout=5000)
+    await page.wait_for_timeout(600)
+
+    asked, ask_text = await wait_dialog(page, lambda raw: True, 5000)
+    if asked is None:
+        return (False, "[마감취소] 를 눌렀는데 아무 창도 뜨지 않았습니다")
+    if "마감취소" in ask_text and ("되었습니다" in ask_text or "했습니다" in ask_text):
+        # 묻지 않고 바로 취소된다 — 「알림 / 마감취소 되었습니다. / 확인」 (2026-10-21 실측)
+        dialog, body = asked, ask_text
+    elif "취소" in ask_text and "하시겠습니까" in ask_text:
+        print(f"  ❔  나이스: 「{ask_text[:80]}」 → 확인")
+        if not await click_dialog_confirm(asked):
+            return (False, "마감취소 확인창의 [확인] 을 못 눌렀습니다")
+        await page.wait_for_timeout(800)
+        dialog, body = await wait_dialog(page, lambda raw: not any(w in raw for w in NOT_RESULT_YET), 8000)
+    else:
+        return (False, f"예상과 다른 창이 떠서 누르지 않았습니다: 「{ask_text[:150]}」")
+
+    if dialog is not None:
+        print(f"  ❔  나이스: 「{body[:80]}」")
+        if any(w in body for w in ("없습니다", "실패", "오류", "불가", "할 수 없")):
+            return (False, f"마감취소가 안 됐습니다 (월마감이 돼 있으면 월마감부터 풀어야 합니다): 「{body[:150]}」")
+        await click_dialog_confirm(dialog)
+        await page.wait_for_timeout(600)
+
+    # 화면을 다시 불러 «마감 안 된 날» 로 바뀌었는지 읽는다
+    if not await set_date_and_search(page, d):
+        return (False, "마감취소 뒤 그날을 다시 불러오지 못했습니다 — 풀렸는지 나이스에서 확인해 주세요")
+    if await day_is_closed(page):
+        return (False, "마감취소를 눌렀는데 아직 마감된 날로 보입니다 — 나이스에서 확인해 주세요")
+    print("  🔓  마감취소 완료 — 고친 뒤 다시 마감합니다")
+    return (True, "")
+
+
+CHECKED_JS = r"""e => {
+  const c = e.closest('[role=checkbox]') || e.querySelector('[role=checkbox]') || e;
+  const a = c.getAttribute('aria-checked');
+  if (a !== null) return a === 'true';
+  const i = c.tagName === 'INPUT' ? c : c.querySelector('input[type=checkbox]');
+  return i ? i.checked : null;
+}"""
+
+
+async def _clean_box(page: Page):
+    """그리드 왼쪽 위 「깨끗이」 체크박스. 켜고 학생 마감 칸을 누르면 그 줄이 지워진다 (나이스출결 스킬 실측)."""
+    for loc in (page.get_by_role("checkbox", name=re.compile("깨끗이")),
+                page.get_by_text("깨끗이", exact=True)):
+        loc = loc.filter(visible=True)
+        if await loc.count() > 0:
+            return loc.first
+    return None
+
+
+async def _set_clean_box(page: Page, box, on: bool) -> bool:
+    """「깨끗이」 를 켜거나 끈다. 바뀐 것을 읽어서 확인했을 때만 True."""
+    if await box.evaluate(CHECKED_JS) == on:
+        return True
+    await box.click(timeout=5000)
+    await page.wait_for_timeout(300)
+    return await box.evaluate(CHECKED_JS) == on
+
+
+async def _magam_cell_text(page: Page, number: str) -> str | None:
+    """그 번호 줄의 마감 칸 글자 (데이터 행 index 3). 줄이 화면에 없으면 None."""
+    cells = await page.evaluate(r"""() => {
+      const o = {};
+      for (const r of document.querySelectorAll('.cl-grid-row')) {
+        const k = r.children;
+        if (k.length > 3) o[(k[0].innerText || '').trim()] = (k[3].innerText || '').trim();
+      }
+      return o;
+    }""")
+    return cells.get(str(number))
+
+
+async def clear_rows(page: Page, d: date, targets: list[dict]) -> list[dict]:
+    """targets 학생 줄을 화면에서 지운다 (저장은 하지 않는다). 돌려주는 값: 실패 목록 (비면 다 지움).
+
+    ⚠️ 「깨끗이」 가 켜진 채로 두면 그 뒤 «넣기» 클릭이 전부 «지우기» 가 된다. 끝에서 반드시 끄고,
+       끈 것을 확인하지 못하면 전체 작업을 멈춘다 (RuntimeError).
+    """
+    box = await _clean_box(page)
+    if box is None:
+        return [_failure(d, FAILED, t, "「깨끗이」 체크박스를 찾지 못해 지우지 못했습니다") for t in targets]
+    if await box.evaluate(CHECKED_JS) is None:
+        return [_failure(d, FAILED, t, "「깨끗이」 가 켜졌는지 읽을 수 없어 지우지 않았습니다") for t in targets]
+    problems = []
+    try:
+        if not await _set_clean_box(page, box, True):
+            return [_failure(d, FAILED, t, "「깨끗이」 를 켜지 못했습니다") for t in targets]
+        for t in targets:
+            try:
+                await click_magam_cell(page, t["name"], t["number"], col=2)
+                await page.wait_for_timeout(400)
+                if await page.locator(".cl-dialog-wrapper:visible").filter(has_text="출결마감구분").count():
+                    problems.append(_failure(d, FAILED, t, "지우려고 눌렀는데 입력 창이 떴습니다 — 지우지 못했습니다"))
+                    break   # 창이 뜬 채로 더 누르지 않는다. 그날은 저장하지 않으니 다시 조회하면 사라진다
+                left = await _magam_cell_text(page, t["number"])
+                if left:
+                    problems.append(_failure(d, FAILED, t, f"지웠는데 마감 칸에 아직 '{left}' 가 남아 있습니다"))
+                else:
+                    print(f"  🧹  {t['number']}번 {t['name']}: '{t['was']}' 지움")
+            except Exception as e:
+                problems.append(_failure(d, FAILED, t, f"지우다 실패 — {type(e).__name__}: {e}"))
+    finally:
+        if not await _set_clean_box(page, box, False):
+            raise RuntimeError("「깨끗이」 체크박스를 끄지 못했습니다 — 켜진 채로 두면 다음 입력이 전부 지우기가 "
+                               "되므로 여기서 멈춥니다. 나이스 화면에서 「깨끗이」 를 직접 꺼 주세요")
+    return problems
+
+
+# ============================================================
 # 메인
 # ============================================================
 async def main():
@@ -1155,6 +1349,8 @@ async def main():
     dry_run = "--dry-run" in args
     # --마감: 저장이 확실하고 실패자가 없는 날만 [출결마감] 까지 누른다 (선생님이 말할 때만)
     do_close = "--마감" in args
+    # --마감풀어둠: 고치려고 [마감취소] 한 날을 다시 마감하지 않는다 (나중에 다시 넣고 마감할 때)
+    keep_open = "--마감풀어둠" in args
     date_arg = next((a for a in args if re.match(r"\d{4}-\d{2}-\d{2}", a)), None)
     if date_arg:
         try:
@@ -1171,17 +1367,28 @@ async def main():
 
     records  = load_from_calendar(start_date, end_date)
     task_map = build_task_map(records)
+    sync = SYNC_DAYS is not None
+    if sync:
+        # 파일에 출결이 한 건도 없는 날도 연다 — 나이스에만 남은 출결을 지워야 하므로
+        for d in SYNC_DAYS:
+            if d.weekday() < 5:
+                task_map.setdefault(d, [])
+        task_map = dict(sorted(task_map.items()))
     total    = sum(len(v) for v in task_map.values())
 
-    if total == 0:
+    if not task_map:
         print("✅  해당 기간에 입력할 출결이 없습니다.")
         sys.exit(0)
 
     print(f"\n📊  {len(task_map)}개 날짜, 총 {total}건\n")
     for d, tasks in task_map.items():
         print(f"  {d.strftime('%m/%d')} — "
-              + " / ".join(f"{t['number']}번 {t['name']}({t['label']})" for t in tasks))
+              + (" / ".join(f"{t['number']}번 {t['name']}({t['label']})" for t in tasks)
+                 or "(출결 없음)"))
     print()
+    if sync:
+        print("🔁  파일 기준으로 맞춥니다: 나이스에 이미 들어간 것이 파일과 다르면 지우고 파일대로 다시 넣고,")
+        print("    파일에 없는 출결은 지웁니다. 마감된 날이 다르면 [마감취소] → 고치기 → 다시 [출결마감] 합니다.\n")
 
     if dry_run:
         print("🔍  --dry-run 이라 여기서 멈춥니다. 나이스는 열지 않았습니다.")
@@ -1253,9 +1460,62 @@ async def main():
                 last_p = day_last_period(day_cols)
                 if last_p:
                     print(f"    이 날 시간표: {last_p}교시까지")
-                day_failures, can_save = await enter_day(page, d, tasks, day_cols)
+                prepare, to_enter = None, tasks
+                reopened = False   # 이 실행에서 [마감취소] 한 날 — 고친 뒤 다시 마감한다
+                if sync:
+                    import verify_attendance
+                    grid = await verify_attendance.read_grid(page)
+                    if not grid and not tasks:
+                        # 10/05·10/09 실측: 「시간표를 확인 하세요」 알림 뒤 표가 0행 — 수업 없는 날로 보인다
+                        print("  ⏭  나이스 표가 비어 있고 파일에도 출결이 없습니다 — 건너뜀 (시간표 없는 날?)")
+                        continue
+                    if not grid:
+                        print("  ⚠️  나이스 표를 읽지 못했습니다 — 지우기 없이 파일 것만 넣습니다")
+                    else:
+                        to_clear, to_enter = plan_sync(tasks, grid)
+                        if not to_clear and not to_enter:
+                            print("  ✅  나이스가 이미 파일과 같습니다 — 고칠 것 없음")
+                            if do_close and not await day_is_closed(page):
+                                ok, why = await close_day(page)
+                                if ok:
+                                    closed.append(d)
+                                else:
+                                    not_closed.append((d, why))
+                                    print(f"  ⛔  {d.strftime('%m/%d')} 마감 못 함 — {why}")
+                                    close_stopped = True
+                                    break
+                            continue
+                        changes = [*to_clear, *[t for t in to_enter
+                                                if t["number"] not in {c["number"] for c in to_clear}]]
+                        if await day_is_closed(page):
+                            # 마감된 날은 칸이 안 눌린다 — [마감취소] 로 풀고 고친 뒤 다시 마감한다
+                            print(f"  🔒  {d.strftime('%m/%d')} 은 마감된 날입니다 ({len(changes)}건 다름) — [마감취소] 하고 고칩니다")
+                            ok, why = await reopen_day(page, d)
+                            if not ok:
+                                print(f"  ⛔  {d.strftime('%m/%d')} 마감취소 못 함 — {why}")
+                                for t in changes:
+                                    failures.append(_failure(d, FAILED, t, f"마감된 날인데 마감취소를 못 해 고치지 않았습니다 — {why}"))
+                                if "예상과 다른 창" in why:
+                                    print("      나머지 날짜는 손대지 않고 멈춥니다.")
+                                    close_stopped = True
+                                    break
+                                continue
+                            reopened = True
+                            # 풀린 화면을 새로 읽는다
+                            day_cols = await read_day_columns(page)
+                            grid = await verify_attendance.read_grid(page)
+                            if grid:
+                                to_clear, to_enter = plan_sync(tasks, grid)
+                        for c in to_clear:
+                            again = " → 파일대로 다시 넣음" if any(t["number"] == c["number"] for t in to_enter) else ""
+                            print(f"  ✏️   {c['number']}번 {c['name']}: 나이스 '{c['was']}' 지움{again}")
+                        if to_clear:
+                            prepare = lambda d=d, to_clear=to_clear: clear_rows(page, d, to_clear)
+                day_failures, can_save = await enter_day(page, d, to_enter, day_cols, prepare)
                 failures.extend(day_failures)
                 if not can_save:
+                    if reopened:
+                        not_closed.append((d, "마감취소 했는데 고치지 못했습니다 — 마감이 풀린 채로 남아 있습니다"))
                     continue
                 # 실패자가 있어도 저장은 그대로 한다 —
                 # 여기서 막으면 이미 들어간 학생들까지 같이 날아간다.
@@ -1272,8 +1532,24 @@ async def main():
                         if (task["number"], task["name"], task["label"]) in already:
                             continue
                         failures.append(_failure(d, UNSURE, task, save_reason))
+                elif sync:
+                    # 저장 뒤 표를 다시 읽어 파일과 같아졌는지 본다 (못 들어간 학생은 이미 ❌ 로 잡혀 있다)
+                    import verify_attendance
+                    grid = await verify_attendance.read_grid(page)
+                    left_clear, left_enter = plan_sync(tasks, grid) if grid else ([], [])
+                    already = {f["number"] for f in failures if f["date"] == d}
+                    for t in [*left_clear, *left_enter]:
+                        if t["number"] in already:
+                            continue
+                        already.add(t["number"])
+                        failures.append(_failure(d, UNSURE, t, "저장 뒤 다시 읽어 보니 나이스가 아직 파일과 다릅니다"))
+                    if grid and not (left_clear or left_enter):
+                        print("  🔎  저장 뒤 다시 읽어 보니 파일과 같습니다")
 
-                if do_close:
+                if reopened and keep_open and not do_close:
+                    not_closed.append((d, "--마감풀어둠 — 마감취소 한 채로 둡니다"))
+                elif do_close or reopened:
+                    # 마감취소 한 날은 --마감 이 없어도 다시 마감한다 (원래 마감돼 있던 날이므로).
                     # 「변경된 내용이 없습니다」 = 이미 넣어 둔 날일 수 있다. 화면 마감 칸이 넣으려던 것과
                     # 전부 같으면 저장된 것으로 보고 마감한다. 하나라도 다르면 마감하지 않는다.
                     if (save_status != SAVE_OK and "변경된 내용이 없습니다" in save_reason
@@ -1282,7 +1558,8 @@ async def main():
                         failures = [f for f in failures if not (f["date"] == d and f["kind"] == UNSURE)]
                         save_status = SAVE_OK
                     if save_status != SAVE_OK or any(f["date"] == d for f in failures):
-                        not_closed.append((d, "저장이 확실하지 않거나 못 들어간 학생이 있어 마감하지 않음"))
+                        left = " — 마감취소 했던 날이라 마감이 풀린 채로 남아 있습니다" if reopened else ""
+                        not_closed.append((d, "저장이 확실하지 않거나 못 들어간 학생이 있어 마감하지 않음" + left))
                         continue
                     ok, why = await close_day(page)
                     if ok:
@@ -1295,7 +1572,7 @@ async def main():
                         break
 
             exit_code = report_failures(failures)
-            if do_close:
+            if do_close or closed or not_closed:   # 마감취소 하고 다시 마감한 날도 여기서 알린다
                 print(f"\n🔒  출결마감: {len(closed)}일 마감 "
                       + (f"({', '.join(x.strftime('%m/%d') for x in closed)})" if closed else ""))
                 for x, why in not_closed:

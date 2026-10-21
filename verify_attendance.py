@@ -216,14 +216,15 @@ def print_report(report):
     print("-" * 62)
 
 
-async def run(start, end):
+async def run(start, end, days=None):
+    """days: 출결이 없어도 볼 날짜 (출결 앱 파일 기간 — 나이스에만 남은 출결을 찾으려고)."""
     M.load_teacher_settings()
     recs = M.load_from_calendar(start, end)
     task_map = M.build_task_map(recs)
     holidays = M.load_holidays()
 
-    dates = [d for d in task_map
-             if start <= d <= end and d.weekday() < 5 and d not in holidays]
+    dates = sorted(d for d in set(task_map) | set(days or ())
+                   if start <= d <= end and d.weekday() < 5 and d not in holidays)
     print(f"검증 대상 {len(dates)}일: " + ", ".join(d.strftime('%m/%d') for d in dates))
 
     PROFILE_DIR = str(teacher_config.CONFIG_DIR / "chrome_profile")
@@ -262,7 +263,7 @@ async def run(start, end):
                     "expected": [
                         {"number": t["number"], "name": t["name"],
                          "gubun": t["gubun"], "jongryu": t["jongryu"], "note": t["note"]}
-                        for t in task_map[d]],
+                        for t in task_map.get(d, [])],
                 }
                 rows = compare_day(result[d.isoformat()]["expected"], actual)
                 result[d.isoformat()]["diff"] = rows

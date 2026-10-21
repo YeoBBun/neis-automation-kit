@@ -19,6 +19,11 @@ neis-automation-kit 의 나이스 입력기(main.py)로 넣는다.
     .\\.venv\\Scripts\\python.exe -X utf8 app_to_neis.py --예약 16:30   ← 평일 그 시각에 --auto 가 돌도록 작업 스케줄러에 등록
     .\\.venv\\Scripts\\python.exe -X utf8 app_to_neis.py --예약해제     ← 예약 지우기
 
+나이스는 «파일 기준» 으로 맞춘다: 파일 기간(from~to) 안에서 나이스에 이미 들어간 출결이 파일과 다르면
+지우고 파일대로 다시 넣고, 파일에 없는 출결은 지운다. 이미 [출결마감] 한 날이 다르면
+[마감취소] 하고 고친 뒤 다시 [출결마감] 한다.
+    .\\.venv\\Scripts\\python.exe -X utf8 app_to_neis.py --추가만      ← 예전처럼 넣기만 (지우거나 고치지 않음)
+
 파일을 지정하지 않으면 이 폴더와 「다운로드」 폴더에서 가장 최근의 attendance_neis_*.json(.txt) 을 쓴다.
 (.txt 는 휴대폰에서 「드라이브로 보내기」 로 공유한 파일 — 내용은 같다)
 키트의 다른 옵션(--dry-run, --future)은 그대로 넘긴다.
@@ -78,6 +83,34 @@ def parse_app_data(data: dict) -> list[dict]:
     return records
 
 
+def file_days(data: dict) -> set[date]:
+    """파일이 책임지는 날짜 (from ~ to). 이 날들은 나이스를 파일에 맞춘다."""
+    s, e = date.fromisoformat(data["from"]), date.fromisoformat(data["to"])
+    return {date.fromordinal(n) for n in range(s.toordinal(), e.toordinal() + 1)}
+
+
+def merge_files(datas: list[dict]) -> tuple[list[dict], set[date]]:
+    """여러 파일을 순서대로(나중 것이 이긴다) 합친다. 돌려주는 값: (레코드, 맞출 날짜).
+
+    날짜 단위로 덮어쓴다 — 나중 파일이 그날을 담고 있으면 앞 파일의 그날 출결은 버린다.
+    ⚠️ (날짜·학생·분류) 단위로 합치면 «지각 → 결석» 으로 고친 학생이 두 건 다 남는다.
+    """
+    records, days = [], set()
+    for data in datas:
+        covered = file_days(data)
+        records = [r for r in records if r["start_date"] not in covered] + parse_app_data(data)
+        days |= covered
+    return records, days
+
+
+def set_sync(kit, days: set[date], args: list[str]) -> None:
+    """나이스를 파일에 맞추게 한다. --추가만 이면 예전처럼 넣기만 한다."""
+    if "--추가만" in args:
+        print("➕  --추가만: 나이스에 이미 있는 것은 지우거나 고치지 않고 넣기만 합니다")
+        return
+    kit.SYNC_DAYS = days
+
+
 # ─── 자동 실행 (작업 스케줄러) ────────────────────────────────
 # 학생 이름이 든 기록·로그는 저장소 밖(%LOCALAPPDATA%\neis-automation)에만 둔다.
 
@@ -130,19 +163,16 @@ def run_auto(kit, extra_args: list[str]) -> int:
     builtins.input = lambda *a, **k: ""
 
     try:
-        records, merged_from, merged_skipped = [], None, []
-        seen = set()
+        datas, merged_from, merged_skipped = [], None, []
         for path in new_files:
             recs, data = load_app_file(path)
             print(f"📄  {path.name}  ({data['from']} ~ {data['to']}, {len(recs)}건)")
-            for r in recs:   # 여러 파일에 같은 날·같은 학생·같은 분류가 있으면 나중 파일 것을 쓴다
-                key = (r["start_date"], r["number"], r["att_type"])
-                if key in seen:
-                    records = [x for x in records if (x["start_date"], x["number"], x["att_type"]) != key]
-                seen.add(key)
-                records.append(r)
+            datas.append(data)
             merged_skipped += data.get("skipped", [])
             merged_from = min(merged_from or data["from"], data["from"])
+        # 여러 파일이 같은 날을 담고 있으면 나중 파일의 그날 것을 쓴다
+        records, days = merge_files(datas)
+        set_sync(kit, days, extra_args)
 
         if merged_skipped:
             print(f"\n⚠️   자동으로 못 넣는 {len(merged_skipped)}건 — 나이스에서 직접 넣어 주세요")
@@ -211,7 +241,7 @@ def main() -> int:
     import main as kit  # 키트의 나이스 입력기
 
     if "--auto" in args or "--자동" in args:
-        return run_auto(kit, [a for a in args if a in ("--마감", "--future", "--dry-run")])
+        return run_auto(kit, [a for a in args if a in ("--마감", "--future", "--dry-run", "--추가만")])
 
     file_arg = next((a for a in args if a.lower().endswith((".json", ".txt"))), None)
     path = Path(file_arg) if file_arg else find_latest_file()
@@ -239,10 +269,15 @@ def main() -> int:
     kit.load_from_calendar = lambda start_date, end_date: records
 
     # --대조: 넣지 않고, 파일과 나이스 화면이 맞는지만 본다 (월마감 1단계). 읽기 전용.
+    # 파일에 출결이 없는 날도 본다 — 나이스에만 남은 출결(「추가」)을 찾으려고.
     if "--대조" in args:
         import verify_attendance
-        asyncio.run(verify_attendance.run(date.fromisoformat(data["from"]), date.fromisoformat(data["to"])))
+        asyncio.run(verify_attendance.run(date.fromisoformat(data["from"]), date.fromisoformat(data["to"]),
+                                          days=file_days(data)))
         return 0
+
+    # 나이스에 이미 들어간 것이 파일과 다르면 파일대로 고친다 (--추가만 이면 넣기만)
+    set_sync(kit, file_days(data), args)
 
     # 키트는 날짜를 안 주면 «이번 달 1일부터» 를 넣는다. 파일 기간의 시작일을 넘겨 준다.
     rest = [a for a in args if a != file_arg]
