@@ -297,7 +297,7 @@ async def click_text(page, text, ymin=0, ymax=99999):
         if it["t"] == text and ymin <= it["y"] <= ymax and "disabled" not in it["cls"]:
             await page.mouse.click(it["x"] + 8, it["y"] + 8)
             return True
-    log(f"    ❌ '{text}' 못 찾음")
+    log(f"    ❌ '{text}' 못 찾음 (같은 글자 위치: {[(it['x'], it['y'], it['cls']) for it in await page.evaluate(LEAF) if it['t'] == text]})")
     return False
 
 
@@ -328,7 +328,7 @@ async def open_stats(page, y, m):
         return False
     await click_text(page, "인정내역 표시")
     await page.wait_for_timeout(400)
-    await click_text(page, "조회", ymin=200, ymax=350)
+    await click_text(page, "조회", ymin=200, ymax=420)   # 2026-11-02 실측 y=351 — 350 으로 막았다가 놓침
     await page.wait_for_timeout(3000)
     await M.dismiss_alert_popup(page, timeout=1500)
     await click_text(page, "음영표시")
