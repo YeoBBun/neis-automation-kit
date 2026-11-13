@@ -5,6 +5,8 @@
   python month_close.py 2026-10 --close         일마감 + 월마감을 실제로 한다
   python month_close.py 2026-10 --download      학급별 출결현황(PDF) · 월별 출결현황(엑셀)을 받는다
   python month_close.py 2026-10 --close --download   둘 다 (로그인 한 번)
+  python month_close.py 2026-11 --close --마감일 13   달 중간 마감: 일마감은 상태만 보고(전체선택 안 누름) 마감일 칸을 13으로 바꿔 월마감
+  python month_close.py 2026-10 --reopen       월마감을 취소한다 (선생님이 말할 때만. 일마감은 그대로 둔다)
 
 받은 파일은 이 폴더의 `출력/` 에 놓인다 (gitignore — 학생 이름이 들어 있다).
   출력/2026-10_학급별출결현황.pdf
@@ -190,9 +192,12 @@ BTNS = """() => {
 
 async def open_month_tab(page):
     await M.dismiss_alert_popup(page, timeout=1500)
-    await page.get_by_role("link", name="반별월출결마감관리", exact=True).first.click()
-    await page.wait_for_timeout(2200)
-    await M.dismiss_alert_popup(page, timeout=1500)
+    try:
+        await page.get_by_role("link", name="반별월출결마감관리", exact=True).first.click(timeout=5000)
+        await page.wait_for_timeout(2200)
+        await M.dismiss_alert_popup(page, timeout=1500)
+    except Exception:
+        log("  (메뉴 링크가 안 보여 지금 탭에서 [조회] 만 다시 누릅니다)")   # 마감·취소 직후 실측 (2026-11-02, 11-04)
     await page.get_by_role("tabpanel").locator("a").filter(has_text=re.compile(r"^조회$")).first.click()
     await page.wait_for_timeout(2500)
 
@@ -217,7 +222,8 @@ async def click_month_row(page, sem, mm):
     return row
 
 
-async def month_close(page, y, m, commit):
+async def month_close(page, y, m, commit, close_day=None):
+    """close_day 를 주면 마감일 칸을 그 날로 바꿔 «그날까지» 월마감한다 (달 중간 마감, 2026-11-13 선생님 요청)."""
     log("\n[2] 월출결마감 — 반별월출결마감관리")
     mm = f"{m:02d}"
     last = calendar.monthrange(y, m)[1]
@@ -251,23 +257,72 @@ async def month_close(page, y, m, commit):
             out.append(info)
             continue
         # 마감일 칸: 비어 있을 때만 그 달 말일을 넣는다 (학기 끝나는 달은 나이스가 학기종료일을 채워 둔다)
-        if await di.count() and not day_val:
+        if close_day:
+            # 달 중간 마감: 칸에 무엇이 있든 그 날로 바꾸고, 다시 읽어 그 숫자가 아니면 누르지 않는다
+            if not await di.count():
+                log("    ⛔ 마감일 칸을 못 찾았습니다 — 마감하지 않습니다")
+                info["state"] = "마감일 칸 없음"
+                out.append(info)
+                continue
+            await di.click(); await di.press("Control+a"); await di.press("Delete")
+            await di.type(str(close_day), delay=80); await di.press("Tab")
+            await page.wait_for_timeout(800)
+            info["day"] = (await di.input_value()).strip()
+            if info["day"].lstrip("0") != str(close_day):
+                log(f"    ⛔ 마감일 칸에 {close_day} 를 넣었는데 «{info['day']}» 로 읽힙니다 — 마감하지 않습니다")
+                info["state"] = "마감일 안 바뀜"
+                await shot(page, "월마감_마감일.png")
+                out.append(info)
+                continue
+            log(f"    마감일 칸을 {info['day']} 로 바꿨습니다 ({m}/{close_day} 까지 마감)")
+        elif await di.count() and not day_val:
             await di.click(); await di.press("Control+a"); await di.type(str(last), delay=50); await di.press("Tab")
             await page.wait_for_timeout(600)
             info["day"] = (await di.input_value()).strip()
             log(f"    마감일 칸이 비어 있어 {info['day']} 을 넣었습니다")
         await page.mouse.click(mg["x"] + 10, mg["y"] + 6)
         await page.wait_for_timeout(1500)
-        await show_popup(page, "마감")
-        await click_confirm(page, timeout=4000); await page.wait_for_timeout(2500)
-        await show_popup(page, "확인1")
-        await click_confirm(page, timeout=4000); await page.wait_for_timeout(2500)
-        await show_popup(page, "확인2")
+        if close_day:
+            # 묻는 창은 .cl-aside 안에 뜬다 (show_popup 의 선택자로는 안 잡힌다, 2026-11-13 실측):
+            #   「확인 / 11월 출결자료가 13일까지 마감됩니다. 마감하시겠습니까? / … / 확인 / 취소」
+            # 창 글자의 날짜가 넣으려던 날과 같을 때만 «그 창 안의» [확인] 을 누른다. 결과창은 따로 안 뜬다.
+            want = f"{m}월 출결자료가 {close_day}일까지 마감됩니다"
+            ask = page.locator(".cl-aside").filter(has_text=want).last
+            try:
+                await ask.wait_for(state="attached", timeout=5000)
+            except Exception:
+                texts = [t.strip().replace("\n", " / ")[:200] for t in await page.locator(".cl-aside").all_inner_texts() if t.strip()]
+                log(f"    ⛔ 「{want}」 창이 안 떠서 누르지 않았습니다. 뜬 창: {texts}")
+                info["state"] = "확인창 다름"
+                await shot(page, "월마감_확인창.png")
+                out.append(info)
+                continue
+            log(f"    ❔ 나이스: 「{want}. 마감하시겠습니까?」 → 확인")
+            await ask.locator('[role="button"]:visible, a:visible').filter(
+                has_text=re.compile(r"^확인$")).last.click(timeout=5000)
+            await page.wait_for_timeout(2500)
+            for t in await page.locator(".cl-aside").all_inner_texts():
+                if t.strip():
+                    log("    [창] " + t.strip().replace("\n", " / ")[:200])
+        else:
+            await show_popup(page, "마감")
+            await click_confirm(page, timeout=4000); await page.wait_for_timeout(2500)
+            await show_popup(page, "확인1")
+            await click_confirm(page, timeout=4000); await page.wait_for_timeout(2500)
+            await show_popup(page, "확인2")
         # 다시 읽어 버튼 상태로 판정한다 (2학기는 표에 날짜 대신 «마감» 글자만 뜬다)
         await open_month_tab(page)
-        await click_month_row(page, sem, mm)
+        row2 = await click_month_row(page, sem, mm)
         mg2, cancel2 = await month_buttons(page)
         done = bool(mg2 and "disabled" in mg2["cls"] and cancel2 and "disabled" not in cancel2["cls"])
+        if close_day and done:
+            # 달 중간 마감은 표 칸에 마감한 날짜가 찍힌다 (실측 «2026.11.13.»). 마감일 칸은 다시 읽으면 말일로 돌아가 보인다
+            cell = row2["k"][2] if row2 else ""
+            want_cell = f"{y}.{m:02d}.{close_day:02d}."
+            info["cell"] = cell
+            if cell != want_cell:
+                log(f"    ⚠️  마감은 됐는데 표 칸이 «{cell}» 입니다 (기대 «{want_cell}») — 나이스에서 확인해 주세요")
+                done = False
         info["state"] = "마감됨" if done else "마감 안 됨"
         log(f"    → {'✅ 월마감 완료' if done else '❌ 마감이 안 됐습니다'}")
         if not done:
@@ -276,6 +331,44 @@ async def month_close(page, y, m, commit):
         out.append(info)
     log("  다시 읽은 표:", [r["k"] for r in await page.evaluate(GRID) if r["k"][1] == mm])
     return {"status": "done" if commit else "dry", "rows": out}
+
+
+async def month_reopen(page, m):
+    """그 달 월마감을 [취소] 한다. 묻는 창에 «취소» 가 없으면 [확인] 을 누르지 않고 멈춘다."""
+    log("\n[2] 월마감 취소 — 반별월출결마감관리")
+    mm = f"{m:02d}"
+    await open_month_tab(page)
+    targets = [r for r in await page.evaluate(GRID) if r["k"][1] == mm]
+    if not targets:
+        log(f"  ⛔ {mm}월 줄이 없습니다")
+        return {"status": "no_row"}
+    out = []
+    for t in sorted(targets, key=lambda r: r["k"][0], reverse=True):   # 8월처럼 두 학기면 뒤 학기부터 푼다
+        sem = t["k"][0]
+        await click_month_row(page, sem, mm)
+        mg, cancel = await month_buttons(page)
+        if not (cancel and "disabled" not in cancel["cls"]):
+            log(f"  {sem}학기 {mm}월 — [취소] 가 잠겨 있습니다 (마감 전으로 보임)")
+            out.append({"semester": sem, "state": "마감 전"})
+            continue
+        await page.mouse.click(cancel["x"] + 10, cancel["y"] + 6)
+        await page.wait_for_timeout(1500)
+        ask = await show_popup(page, "취소")
+        if not any("취소" in a for a in ask):
+            log("  ⛔ 예상과 다른 창이라 [확인] 을 누르지 않고 멈춥니다")
+            await shot(page, "월마감취소_창.png")
+            out.append({"semester": sem, "state": "알 수 없음"})
+            break
+        await click_confirm(page, timeout=4000); await page.wait_for_timeout(2500)
+        await show_popup(page, "확인1")
+        await click_confirm(page, timeout=2000); await page.wait_for_timeout(1500)
+        await open_month_tab(page)
+        await click_month_row(page, sem, mm)
+        mg2, cancel2 = await month_buttons(page)
+        opened = bool(mg2 and "disabled" not in mg2["cls"])
+        log(f"    → {'✅ 월마감 취소됨' if opened else '❌ 아직 마감된 달로 보입니다'}")
+        out.append({"semester": sem, "state": "마감 전" if opened else "마감됨"})
+    return {"status": "reopen", "rows": out}
 
 
 # ──────────────────────────────────────────────────────────────
@@ -501,19 +594,30 @@ async def download(p, y, m):
     return files
 
 
-async def run(y, m, do_close, do_download):
+async def run(y, m, do_close, do_download, do_reopen=False, close_day=None):
     M.load_teacher_settings()
     async with async_playwright() as p:
         page = None
+        if do_reopen:
+            try:
+                async with Session(p) as page:
+                    RESULT["month_close"] = await month_reopen(page, m)
+            except Exception as e:
+                RESULT["error"] = str(e)[:200]
+            rows = (RESULT["month_close"] or {}).get("rows", [])
+            RESULT["ok"] = "error" not in RESULT and bool(rows) and all(r["state"] == "마감 전" for r in rows)
+            return
         try:
             async with Session(p) as page:
-                RESULT["day_close"] = await day_close(page, y, m, do_close)
+                # 달 중간 마감이면 [전체선택] 을 누르지 않는다 — 누르면 마감일 뒤의 날까지 일마감된다.
+                # 그날까지의 일마감은 app_to_neis.py --마감 으로 해 둔 것을 전제로 하고, 상태만 읽는다.
+                RESULT["day_close"] = await day_close(page, y, m, do_close and not close_day)
                 dc = RESULT["day_close"]["status"]
-                if do_close and dc != "saved":
+                if do_close and not close_day and dc != "saved":
                     log("\n⛔ 일마감을 못 해서 월마감은 하지 않았습니다")
                     RESULT["month_close"] = {"status": "skipped"}
                 else:
-                    RESULT["month_close"] = await month_close(page, y, m, do_close)
+                    RESULT["month_close"] = await month_close(page, y, m, do_close, close_day)
         except Exception as e:
             import traceback
             traceback.print_exc()
@@ -538,23 +642,42 @@ def main():
     y, m = map(int, ym.split("-"))
     RESULT["month"] = f"{y}-{m:02d}"
     do_close, do_download = "--close" in args, "--download" in args
+    do_reopen = "--reopen" in args
+    if do_reopen and (do_close or do_download):
+        print("⛔ --reopen 은 혼자만 씁니다")
+        print("RESULT_JSON " + json.dumps({"ok": False, "error": "reopen_alone"}, ensure_ascii=False))
+        return 2
     if (y, m) > (date.today().year, date.today().month):
         print("⛔ 아직 오지 않은 달은 마감하지 않습니다")
         print("RESULT_JSON " + json.dumps({"ok": False, "error": "future_month"}, ensure_ascii=False))
         return 2
+    close_day = None
+    if "--마감일" in args:
+        i = args.index("--마감일")
+        v = args[i + 1] if i + 1 < len(args) else ""
+        if not v.isdigit() or not (1 <= int(v) <= calendar.monthrange(y, m)[1]):
+            print("⛔ --마감일 뒤에 그 달의 날짜 숫자를 주세요 (예: --마감일 13)")
+            print("RESULT_JSON " + json.dumps({"ok": False, "error": "bad_close_day"}, ensure_ascii=False))
+            return 2
+        close_day = int(v)
+        if date(y, m, close_day) > date.today():
+            print("⛔ 마감일이 오늘보다 뒤입니다")
+            print("RESULT_JSON " + json.dumps({"ok": False, "error": "future_close_day"}, ensure_ascii=False))
+            return 2
+        RESULT["close_day"] = close_day
     last_weekday = max(date(y, m, d) for d in range(1, calendar.monthrange(y, m)[1] + 1)
                        if date(y, m, d).weekday() < 5)
-    if do_close and date.today() < last_weekday and "--force" not in args:
+    if do_close and not close_day and date.today() < last_weekday and "--force" not in args:
         print(f"⛔ {m}월의 마지막 평일({last_weekday.month}/{last_weekday.day}) 전이라 마감하지 않습니다.")
         print("   그 전에 꼭 마감해야 하면 --force 를 붙이세요 (남은 날의 출결은 마감 뒤에 못 넣습니다).")
         print("RESULT_JSON " + json.dumps({"ok": False, "error": "month_not_over"}, ensure_ascii=False))
         return 2
     log("=" * 52)
     log(f"🏫  나이스 월 출결마감 — {y}년 {m}월"
-        + ("" if (do_close or do_download) else "  (상태만 보기)"))
+        + ("  (월마감 취소)" if do_reopen else "" if (do_close or do_download) else "  (상태만 보기)"))
     log("=" * 52)
     try:
-        asyncio.run(run(y, m, do_close, do_download))
+        asyncio.run(run(y, m, do_close, do_download, do_reopen, close_day))
     except teacher_config.ConfigMissingError as e:
         log(f"❌ {e}")
         RESULT["error"] = "config"

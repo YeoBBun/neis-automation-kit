@@ -43,6 +43,7 @@ FORMAT = "attendance-app/neis-v1"
 PATTERNS = ("attendance_neis_*.json", "attendance_neis_*.txt")
 HERE = Path(__file__).resolve().parent
 TASK_NAME = "AttendanceAppNeis"
+RESULT_LABEL = re.compile(r"(\S+결과) \((\d+(?:·\d+)*)교시\)")
 
 
 def candidate_files() -> list[Path]:
@@ -66,9 +67,32 @@ def load_app_file(path: Path) -> tuple[list[dict], dict]:
     return parse_app_data(data), data
 
 
+def split_skipped(data: dict) -> tuple[list[dict], list[dict]]:
+    """앱이 skipped 로 뺀 건을 (키트가 넣을 수 있는 결과, 그래도 못 넣는 건) 으로 나눈다.
+
+    앱은 결과를 skipped 에 「질병결과 (1·2교시)」 모양으로 담는다. 교시가 있으면 키트가 넣는다.
+    """
+    results, others = [], []
+    for s in data.get("skipped", []):
+        (results if RESULT_LABEL.fullmatch(s.get("label", "")) else others).append(s)
+    return results, others
+
+
 def parse_app_data(data: dict) -> list[dict]:
     """앱 파일 내용(dict)을 키트 레코드 목록으로 바꾼다."""
     records = []
+    for s in split_skipped(data)[0]:
+        att_type, periods = RESULT_LABEL.fullmatch(s["label"]).groups()
+        d = date.fromisoformat(s["date"])
+        records.append({
+            "number":     str(s["number"]),
+            "name":       s["name"],
+            "att_type":   att_type,
+            "start_date": d,
+            "end_date":   d,
+            "note":       f"{periods}교시",
+            "memo":       s.get("memo", ""),
+        })
     for r in data["records"]:
         d = date.fromisoformat(r["date"])
         records.append({
@@ -81,6 +105,27 @@ def parse_app_data(data: dict) -> list[dict]:
             "memo":       r.get("memo", ""),   # 상세 사유 → 나이스 「사유」 칸
         })
     return records
+
+
+def split_manual(records: list[dict]) -> tuple[list[dict], list[dict]]:
+    """(키트가 넣을 건, 선생님이 직접 넣을 건) 으로 나눈다.
+    같은 학생이 같은 날 두 건 이상(결과+조퇴 등)이면 선생님이 직접 넣기로 했다 (2026-11-04)."""
+    count: dict[tuple, int] = {}
+    for r in records:
+        key = (r["start_date"], r["number"])
+        count[key] = count.get(key, 0) + 1
+    auto = [r for r in records if count[(r["start_date"], r["number"])] == 1]
+    manual = [r for r in records if count[(r["start_date"], r["number"])] > 1]
+    return auto, manual
+
+
+def print_manual(manual: list[dict]) -> None:
+    if not manual:
+        return
+    print(f"\n✋  같은 학생이 같은 날 두 건 — 나이스에 직접 넣어 주세요 ({len(manual)}건, 키트는 넣거나 지우지 않습니다)")
+    for r in manual:
+        print(f"    {r['start_date']}  {r['number']}번 {r['name']} {r['att_type']} {r['note']}")
+    print()
 
 
 def file_days(data: dict) -> set[date]:
@@ -103,8 +148,12 @@ def merge_files(datas: list[dict]) -> tuple[list[dict], set[date]]:
     return records, days
 
 
-def set_sync(kit, days: set[date], args: list[str]) -> None:
-    """나이스를 파일에 맞추게 한다. --추가만 이면 예전처럼 넣기만 한다."""
+def set_sync(kit, days: set[date], args: list[str], datas: list[dict] = (), manual: list[dict] = ()) -> None:
+    """나이스를 파일에 맞추게 한다. --추가만 이면 예전처럼 넣기만 한다.
+    파일에 못 담긴 건(선생님이 직접 넣는 건)은 지우지 않게 kit.SYNC_KEEP 에 적는다."""
+    kit.SYNC_KEEP = {(date.fromisoformat(s["date"]), str(s["number"]))
+                     for data in datas for s in split_skipped(data)[1]}
+    kit.SYNC_KEEP |= {(r["start_date"], str(r["number"])) for r in manual}
     if "--추가만" in args:
         print("➕  --추가만: 나이스에 이미 있는 것은 지우거나 고치지 않고 넣기만 합니다")
         return
@@ -168,11 +217,13 @@ def run_auto(kit, extra_args: list[str]) -> int:
             recs, data = load_app_file(path)
             print(f"📄  {path.name}  ({data['from']} ~ {data['to']}, {len(recs)}건)")
             datas.append(data)
-            merged_skipped += data.get("skipped", [])
+            merged_skipped += split_skipped(data)[1]
             merged_from = min(merged_from or data["from"], data["from"])
         # 여러 파일이 같은 날을 담고 있으면 나중 파일의 그날 것을 쓴다
         records, days = merge_files(datas)
-        set_sync(kit, days, extra_args)
+        records, manual = split_manual(records)
+        set_sync(kit, days, extra_args, datas, manual)
+        print_manual(manual)
 
         if merged_skipped:
             print(f"\n⚠️   자동으로 못 넣는 {len(merged_skipped)}건 — 나이스에서 직접 넣어 주세요")
@@ -258,7 +309,7 @@ def main() -> int:
     else:
         print(f"📝  사유 칸: {with_memo}건 모두 채웁니다")
 
-    skipped = data.get("skipped", [])
+    skipped = split_skipped(data)[1]
     if skipped:
         print(f"\n⚠️   자동으로 못 넣는 {len(skipped)}건 — 나이스에서 직접 넣어 주세요")
         for s in skipped:
@@ -276,8 +327,13 @@ def main() -> int:
                                           days=file_days(data)))
         return 0
 
+    # 같은 학생이 같은 날 두 건이면 넣지 않는다 (위 --대조 는 그 건까지 견준다)
+    auto, manual = split_manual(records)
+    kit.load_from_calendar = lambda start_date, end_date: auto
+    print_manual(manual)
+
     # 나이스에 이미 들어간 것이 파일과 다르면 파일대로 고친다 (--추가만 이면 넣기만)
-    set_sync(kit, file_days(data), args)
+    set_sync(kit, file_days(data), args, [data], manual)
 
     # 키트는 날짜를 안 주면 «이번 달 1일부터» 를 넣는다. 파일 기간의 시작일을 넘겨 준다.
     rest = [a for a in args if a != file_arg]

@@ -142,6 +142,11 @@ def _check_periods(jongryu, note, marks):
     got = _marked_periods(marks)
     if not got:
         return "빠진 교시 표시(/)가 하나도 없음"
+    if jongryu == "결과":                 # 결과는 적힌 교시와 «똑같아야» 한다
+        want = M.parse_result_periods(note)
+        if want and got != want:
+            return f"{want}교시여야 하는데 나이스는 {got}교시"
+        return None
     if jongryu not in ("조퇴", "지각"):
         return None                       # 결석은 전 교시가 대상이라 범위를 따로 보지 않는다
     want = M.parse_gyosi_num(note, jongryu)
@@ -157,6 +162,9 @@ def compare_day(expected, actual):
     """하루치 대조 → [(상태, 메시지)]. 상태: ok / 빠짐 / 분류다름 / 교시다름 / 추가"""
     rows = []
     seen = set()
+    by_num = {}
+    for t in expected:
+        by_num.setdefault(str(t["number"]), []).append(t)
     for t in expected:
         num = str(t["number"])
         want = f"{t['gubun']}{t['jongryu']}"
@@ -170,6 +178,10 @@ def compare_day(expected, actual):
         got = marks.get("마감", "")
         if not got:
             rows.append(("빠짐", f"{head} → 나이스에 안 들어갔습니다 (그 줄이 비어 있음)"))
+            continue
+        # 하루 두 건(결과+조퇴 등)은 한 줄에 합쳐 보인다 — 건별로 견주지 않고 줄 전체로 본다
+        if len(by_num[num]) > 1 and M.same_as_tasks(by_num[num], marks):
+            rows.append(("ok", head))
             continue
         if got != want:
             rows.append(("분류다름", f"{head} → 나이스에는 '{got}' 입니다"))

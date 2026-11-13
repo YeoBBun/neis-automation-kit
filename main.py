@@ -82,6 +82,10 @@ ATTENDANCE_MAP = {
     "미인정조퇴":   ("미인정",  "조퇴"),
     "기타조퇴":     ("기타",    "조퇴"),
     "출석인정조퇴": ("출석인정","조퇴"),
+    "질병결과":     ("질병",    "결과"),
+    "미인정결과":   ("미인정",  "결과"),
+    "기타결과":     ("기타",    "결과"),
+    "출석인정결과": ("출석인정","결과"),
 }
 
 # ============================================================
@@ -175,6 +179,8 @@ def _missed_periods(task: dict) -> float:
     jongryu = task["jongryu"]
     if jongryu == "결석":
         return 99  # 하루 전체
+    if jongryu == "결과":
+        return len(parse_result_periods(task["note"]))  # 적힌 교시만 빠짐
     g = parse_gyosi_num(task["note"], jongryu)
     if g is None:
         return 50  # 교시 미상이면 중간 순위
@@ -514,6 +520,79 @@ async def dismiss_notice_popup(page: Page, timeout: int = 3000, rounds: int = 3)
     return closed_any
 
 
+LOADING_MARK = "로딩 중"   # 「로딩 중입니다.」 — .cl-aside 안에 떠서 클릭을 막는다 (2026-11-13 실측, 15초 넘게 갈 때도 있다)
+
+
+async def wait_loading(page: Page, timeout_ms: int = 40_000) -> bool:
+    """나이스 「로딩 중입니다.」 가 사라질 때까지 기다린다. 사라졌으면(또는 처음부터 없으면) True.
+
+    이게 떠 있는 동안 [조회] 를 누르면 안 먹고, 표를 읽으면 덜 불러온 표를 읽는다.
+    """
+    loading = page.locator(".cl-aside").filter(has_text=LOADING_MARK)
+    waited = 0
+    while waited < timeout_ms:
+        visible = False
+        for i in range(await loading.count()):
+            try:
+                if (await loading.nth(i).inner_text()).strip():
+                    visible = True
+                    break
+            except Exception:
+                pass
+        if not visible:
+            if waited >= 2000:
+                print(f"    (로딩 {waited // 1000}초 기다림)")
+            return True
+        await page.wait_for_timeout(250)
+        waited += 250
+    print(f"  ⚠️  「로딩 중입니다」 가 {timeout_ms // 1000}초 넘게 떠 있습니다")
+    return False
+
+
+async def clear_blockers(page: Page) -> None:
+    """[조회] 등을 가리는 창을 치운다. 무슨 창이었는지 글자를 남긴다.
+
+    알림(제목 「알림」)·공지 팝업은 전용 함수로 닫고, 그 밖에 .cl-aside 안에 떠 있는 창은
+    «그 창 안의» [확인]/[닫기] 만 누른다 (전역 닫기는 브라우저를 닫은 적이 있어 금지).
+    묻는 창(…하시겠습니까)은 [확인] 이 무슨 일을 할지 몰라 누르지 않는다.
+    """
+    await wait_loading(page)
+    await dismiss_alert_popup(page, timeout=1500)
+    await dismiss_notice_popup(page, timeout=500, rounds=1)
+    asides = page.locator(".cl-aside")
+    pressed_esc = False
+    for i in range(await asides.count()):
+        box = asides.nth(i)
+        try:
+            text = (await box.inner_text()).strip()
+        except Exception:
+            continue
+        if not text or LOADING_MARK in text:
+            continue
+        one = " / ".join(ln.strip() for ln in text.splitlines() if ln.strip())[:120]
+        if "하시겠습니까" in text:
+            print(f"  ⚠️  가린 창이 묻는 창이라 누르지 않았습니다: 「{one}」")
+            continue
+        btn = box.locator('[role="button"]:visible, a:visible').filter(has_text=re.compile(r"^(확인|닫기)$"))
+        try:
+            if await btn.count():
+                await btn.last.click(timeout=3000)
+                print(f"  ℹ️  가린 창 닫기: 「{one}」")
+                await page.wait_for_timeout(400)
+                continue
+        except Exception:
+            pass
+        # 확인/닫기 가 없는 창 (안 닫힌 달력 등) — Esc 로 닫는다
+        if not pressed_esc:
+            print(f"  ℹ️  가린 창(버튼 없음)을 Esc 로 닫습니다: 「{one}」")
+            await page.keyboard.press("Escape")
+            pressed_esc = True
+            await page.wait_for_timeout(400)
+    if not pressed_esc and await page.locator(".cl-overlay").count():
+        await page.keyboard.press("Escape")       # 사이드바 등이 덮고 있을 때 (set_date_and_search 맨 앞과 같은 처리)
+    await page.wait_for_timeout(300)
+
+
 async def set_date_and_search(page: Page, d: date) -> bool:
     date_str = d.strftime("%Y.%m.%d.")
     target_name = f"{d.year}년 {d.month}월 {d.day}일 {KOREAN_WEEKDAYS[d.weekday()]}"
@@ -546,11 +625,13 @@ async def set_date_and_search(page: Page, d: date) -> bool:
     await page.wait_for_timeout(400)
 
     # 날짜 버튼 클릭 (달 이동 필요시 최대 6번 시도)
-    date_btn = page.get_by_role("button", name=target_name)
+    # 이미 골라져 있는 날(처음 열면 오늘)은 이름이 「선택됨: 2026년 11월 13일」 — 요일이 없다 (2026-11-13 실측)
+    date_btn = page.get_by_role("button", name=re.compile(
+        rf"^(?:{re.escape(target_name)}|선택됨: {d.year}년 {d.month}월 {d.day}일)$"))
     found = False
     for _ in range(6):
         if await date_btn.count() > 0:
-            await date_btn.click()
+            await date_btn.first.click()
             found = True
             break
         prev = page.locator("button").filter(has_text=re.compile(r"이전|prev", re.IGNORECASE))
@@ -597,25 +678,38 @@ async def set_date_and_search(page: Page, d: date) -> bool:
         print(f"  ⛔  날짜가 안 바뀌었습니다 — 화면: {', '.join(seen_dates)} / 넣으려던 날: {date_str}")
         return False
 
+    # 날짜를 바꾸면 나이스가 서버에 다녀오며 「로딩 중입니다」 를 띄운다 — 사라질 때까지 기다린다
+    await wait_loading(page)
     # 날짜를 바꾸면 나이스가 "학적변동 시간표 확인하세요" 같은 알림 팝업을 바로 띄우는
     # 경우가 있음 — 안 닫으면 팝업 오버레이가 조회 버튼 클릭을 막아 타임아웃 남
     await dismiss_alert_popup(page, timeout=1500)
 
     # 조회 클릭 (tabpanel 안의 <a> 태그)
-    # 알림 팝업이 위 dismiss_alert_popup 체크 이후 뒤늦게 뜨는 경우가 있어
-    # 오버레이가 클릭을 막으면(30초 타임아웃 대신) 팝업을 다시 닫고 재시도한다.
+    # ⚠️ «눌렀다» 만으로 믿지 않는다. 2026-11-13 실측: 창이 [조회] 를 가린 채 force 클릭으로 넘어가
+    #    날짜 칸만 11/10 이고 표는 앞날(11/09) 그대로 남았다 → 마감된 날로 잘못 보고 [마감취소] 를 누르려 했다.
+    #    그래서 클릭 «뒤에» 나이스로 조회 요청(POST)이 실제로 나갔는지를 본다. 안 나갔으면 가린 창을 치우고
+    #    다시 누르고, 끝내 안 나가면 그날은 건너뛴다 (엉뚱한 날 화면에 적는 것이 제일 나쁘다).
     조회_btn = page.get_by_role("tabpanel").locator("a").filter(has_text=re.compile(r"^조회$"))
+    queried = False
     for attempt in range(3):
         try:
-            await 조회_btn.click(timeout=5000)
+            async with page.expect_response(
+                    lambda r: r.request.method == "POST" and r.request.resource_type in ("xhr", "fetch"),
+                    timeout=30_000) as resp:
+                await 조회_btn.click(timeout=8000)
+            await resp.value
+            queried = True
             break
         except Exception:
-            print("  ⚠️  조회 클릭 막힘 (알림 팝업 추정) — 확인 클릭 후 재시도")
-            await dismiss_alert_popup(page, timeout=3000)
-            await page.wait_for_timeout(300)
-    else:
-        await 조회_btn.click(force=True)
+            print(f"  ⚠️  [조회] 가 안 먹었습니다 (가린 창 추정) — 창을 닫고 다시 누릅니다 ({attempt + 1}/3)")
+            await clear_blockers(page)
+    if not queried:
+        print("  ⛔  [조회] 를 눌러도 나이스가 표를 다시 불러오지 않았습니다")
+        return False
     print("  ✅  조회 클릭")
+    # 응답이 와도 표를 그리는 동안 「로딩 중」 이 남아 있을 수 있다 — 다 그린 뒤에 읽는다
+    if not await wait_loading(page):
+        return False
 
     # 알림 팝업 처리
     await dismiss_alert_popup(page, timeout=2000)
@@ -642,6 +736,11 @@ def parse_gyosi_num(note: str, jongryu: str = "") -> int | None:
     if not nums:
         return None
     return int(nums[-1]) if jongryu == "지각" else int(nums[0])
+
+
+def parse_result_periods(note: str) -> list[int]:
+    """결과의 빠진 교시 전부 (e.g. '1·2교시'→[1, 2]). 조퇴·지각과 달리 이어져 있지 않을 수 있다."""
+    return sorted({int(n) for n in re.findall(r"\d+", note or "")})
 
 
 
@@ -783,6 +882,22 @@ SAVE_OK     = "saved"    # 나이스가 결과창으로 답한 것을 확인했�
 SAVE_UNSURE = "unsure"   # 그렇게 답하지 않았다 — 안 들어갔을 수도 있다
 
 
+async def click_period_cell(page: Page, name: str, number: str, col: int):
+    """구분·종류를 넣은 행의 교시 칸(td 0-based col)을 누른다."""
+    row = await pick_student_row(page, name, number)
+    nth = col + 2
+    cell = row.locator(f"> div:nth-child({nth})").locator(".cl-text")
+    if await cell.count() == 0:
+        cell = row.locator(f"> div:nth-child({nth})")
+    await cell.click(timeout=5000)
+    await page.wait_for_timeout(300)
+    # 교시 셀 클릭 후 팝업이 다시 열리면 그대로 적용
+    apply_btn = page.locator("a").filter(has_text=re.compile(r"^적용$"))
+    if await apply_btn.count() > 0:
+        await apply_btn.click()
+        await page.wait_for_timeout(300)
+
+
 async def enter_student(page: Page, task: dict, day_cols=None) -> tuple[str, str] | None:
     """한 학생의 출결을 입력한다.
 
@@ -825,6 +940,15 @@ async def enter_student(page: Page, task: dict, day_cols=None) -> tuple[str, str
                   f"— note '{note}' 의 {_g}교시는 없는 교시라 입력하지 않았습니다.")
             print(f"      캘린더 제목을 그날 시간표에 맞게 고친 뒤 다시 돌려주세요.")
             return (FAILED, f"이 날은 {last}교시까지인데 note '{note}' 는 {_g}교시를 가리킴")
+    if jongryu == "결과":
+        periods = parse_result_periods(note)
+        if not periods:
+            print(f"  ❌  {number}번 {name}: note '{note}' 에서 교시를 못 읽어 입력하지 않았습니다.")
+            return (FAILED, f"결과인데 note '{note}' 에서 교시를 못 읽음")
+        if day_cols and (bad := [g for g in periods if gyosi_col_index(g, day_cols) is None]):
+            last = day_last_period(day_cols)
+            print(f"  ⛔  {number}번 {name}: 이 날은 {last}교시까지입니다 — {bad}교시는 없는 교시라 입력하지 않았습니다.")
+            return (FAILED, f"이 날은 {last}교시까지인데 note '{note}' 는 {bad}교시를 가리킴")
 
     applied = False   # 구분·종류가 «들어간» 뒤부터 True — 여기서 터지면 ❌ 가 아니라 ⚠️ 다
 
@@ -834,23 +958,16 @@ async def enter_student(page: Page, task: dict, day_cols=None) -> tuple[str, str
         await handle_magam_popup(page, gubun, jongryu, task.get("memo", ""))
         applied = True   # 여기까지 왔으면 구분·종류는 화면에 들어갔다
 
-        if jongryu in ("조퇴", "지각"):
+        if jongryu == "결과":
+            # 결과는 적힌 교시 칸을 하나씩 누른다 (실제로 들어갔는지는 저장 뒤 다시 읽어 교시까지 견준다)
+            for g in parse_result_periods(note):
+                await click_period_cell(page, name, number, gyosi_col_index(g, day_cols))
+            print(f"  ✅  {number}번 {name}: {gubun}/{jongryu} {note}")
+        elif jongryu in ("조퇴", "지각"):
             # 2단계: 교시 셀 클릭 (마감 팝업 적용 후 수정된 행에서 해당 교시 셀 클릭)
             # 교시를 못 읽는 경우는 위에서 이미 걸러냈다 — 여기서 gyosi_num 은 None 이 아니다.
             gyosi_num = parse_gyosi_num(note, jongryu)
-            col = gyosi_col_index(gyosi_num, day_cols)
-            row = await pick_student_row(page, name, number)
-            nth = col + 2
-            cell = row.locator(f"> div:nth-child({nth})").locator(".cl-text")
-            if await cell.count() == 0:
-                cell = row.locator(f"> div:nth-child({nth})")
-            await cell.click(timeout=5000)
-            await page.wait_for_timeout(300)
-            # 교시 셀 클릭 후 팝업이 다시 열리면 그대로 적용
-            apply_btn = page.locator("a").filter(has_text=re.compile(r"^적용$"))
-            if await apply_btn.count() > 0:
-                await apply_btn.click()
-                await page.wait_for_timeout(300)
+            await click_period_cell(page, name, number, gyosi_col_index(gyosi_num, day_cols))
             gyosi_label = " 조회" if gyosi_num == 0 else f" {gyosi_num}교시"
             print(f"  ✅  {number}번 {name}: {gubun}/{jongryu}{gyosi_label}")
         else:
@@ -1148,27 +1265,57 @@ async def close_day(page: Page) -> tuple[bool, str]:
 # app_to_neis.py 가 «파일이 책임지는 날짜» 를 넣어 준다. None 이면 예전처럼 넣기만 한다
 # (구글 캘린더 방식은 맞추지 않는다).
 SYNC_DAYS: set[date] | None = None
+# 파일 기준 맞추기에서 손대지 않을 (날짜, 번호) — 파일에 못 담겨 선생님이 직접 넣는 건. 지우면 안 된다.
+SYNC_KEEP: set[tuple[date, str]] = set()
 
 
 def _same_as_file(task: dict, cells: dict) -> bool:
     """나이스 그 학생 줄(cells)이 파일의 출결(task) 한 건과 같은지."""
     if cells.get("마감", "") != f"{task['gubun']}{task['jongryu']}":
         return False
-    if task["jongryu"] not in ("조퇴", "지각"):
+    if task["jongryu"] not in ("조퇴", "지각", "결과"):
         return True   # 결석은 분류만 본다
     import verify_attendance as V
     marks = {k: v for k, v in cells.items() if k not in ("번호", "성명") and v}
     return V._check_periods(task["jongryu"], task["note"], marks) is None
 
 
-def plan_sync(tasks: list[dict], grid: dict) -> tuple[list[dict], list[dict]]:
+def same_as_tasks(tasks: list[dict], cells: dict) -> bool:
+    """나이스 그 학생 줄이 파일의 그날 출결 «전부» 와 같은지. 하루 두 건(결과+조퇴 등)도 본다.
+
+    한 줄의 «마감» 칸에는 마지막에 넣은 분류가 남는다고 본다 (넣는 순서는 build_task_map 이 정한다).
+    빠진 교시는 각 건이 말하는 교시가 다 있고, 어느 건으로도 설명 안 되는 교시가 없어야 같다.
+    """
+    if len(tasks) == 1:
+        return _same_as_file(tasks[0], cells)
+    if cells.get("마감", "") != f"{tasks[-1]['gubun']}{tasks[-1]['jongryu']}":
+        return False
+    import verify_attendance as V
+    got = set(V._marked_periods({k: v for k, v in cells.items() if k not in ("번호", "성명") and v}))
+    explained = set()
+    for t in tasks:
+        if t["jongryu"] == "결과":
+            want = set(parse_result_periods(t["note"]))
+            if not want or not want <= got:
+                return False
+            explained |= want
+            continue
+        g = parse_gyosi_num(t["note"], t["jongryu"])
+        if t["jongryu"] not in ("조퇴", "지각") or g is None or g not in got:
+            return False
+        explained |= {n for n in got if (n >= g if t["jongryu"] == "조퇴" else n <= g)}
+    return got <= explained
+
+
+def plan_sync(tasks: list[dict], grid: dict, keep=()) -> tuple[list[dict], list[dict]]:
     """파일(tasks)과 나이스 화면(grid: 번호 → {컬럼: 값})을 견줘 (지울 줄, 넣을 출결) 을 돌려준다.
 
     - 나이스에만 있는 출결            → 지운다
     - 분류·교시가 다른 학생          → 지우고 파일대로 다시 넣는다
     - 나이스에 없는 학생             → 넣는다
     - 같은 학생                       → 건드리지 않는다
-    같은 학생이 그날 두 건(지각+조퇴)이면 화면 한 칸으로 견줄 수 없어 늘 지우고 다시 넣는다.
+    - keep 에 든 학생                → 줄이 차 있으면 건드리지 않는다 (선생님이 직접 넣는 건)
+    같은 학생이 그날 두 건(지각+조퇴)이면 same_as_tasks 로 견줘, 다르면 지우고 다시 넣는다.
     사유 칸은 견주지 않는다 (화면 표시가 파일 글자와 같은지 실측하지 않았다).
     """
     by_num: dict[str, list[dict]] = {}
@@ -1181,9 +1328,11 @@ def plan_sync(tasks: list[dict], grid: dict) -> tuple[list[dict], list[dict]]:
             if num in by_num:
                 to_enter += by_num[num]
             continue
+        if num in keep:
+            continue
         if num in by_num:
             ts = by_num[num]
-            if len(ts) == 1 and _same_as_file(ts[0], cells):
+            if same_as_tasks(ts, cells):
                 continue
             to_enter += ts
         to_clear.append({"number": num, "name": cells.get("성명", ""), "label": "지우기", "was": got})
@@ -1327,6 +1476,43 @@ async def clear_rows(page: Page, d: date, targets: list[dict]) -> list[dict]:
 # ============================================================
 # 메인
 # ============================================================
+async def final_check(page: Page, handled: list, do_close: bool) -> int:
+    """다 넣은 뒤 «같은 창에서» 날짜마다 다시 불러와 파일과 같은지(그리고 --마감 이면 마감됐는지) 읽는다.
+
+    예전에는 끝난 뒤 --대조 로 크롬을 새로 열어 다시 로그인했다. 돌려주는 값: 문제가 있는 날 수.
+    """
+    import verify_attendance
+    print("\n" + "=" * 52)
+    print(f"🔎  마지막 점검 — 같은 창에서 {len(handled)}일을 다시 읽습니다")
+    print("=" * 52)
+    bad = 0
+    for d, tasks, keep in handled:
+        tag = d.strftime("%m/%d")
+        await dismiss_alert_popup(page, timeout=800)
+        if not await set_date_and_search(page, d):
+            print(f"  ❓  {tag} 화면을 다시 불러오지 못했습니다 — 나이스에서 확인해 주세요")
+            bad += 1
+            continue
+        grid = await verify_attendance.read_grid(page)
+        if not grid:
+            print(f"  ❓  {tag} 표를 읽지 못했습니다")
+            bad += 1
+            continue
+        left_clear, left_enter = plan_sync(tasks, grid, keep)
+        is_closed = await day_is_closed(page) if do_close else None
+        diff = len({t["number"] for t in [*left_clear, *left_enter]})
+        state = "" if is_closed is None else (" · 마감됨" if is_closed else " · ⚠️ 마감 안 됨")
+        if diff:
+            print(f"  ❌  {tag} 파일과 {diff}명 다릅니다{state}")
+            bad += 1
+        else:
+            print(f"  ✅  {tag} 파일과 같음 ({len(tasks)}건){state}")
+            if is_closed is False:
+                bad += 1
+    print(f"\n  → {len(handled) - bad}일 이상 없음" + (f" / {bad}일 확인 필요" if bad else " — 전부 맞습니다"))
+    return bad
+
+
 async def main():
     args = sys.argv[1:]
 
@@ -1425,6 +1611,7 @@ async def main():
         closed: list[date] = []               # --마감 으로 마감한 날
         not_closed: list[tuple[date, str]] = []  # --마감 인데 마감하지 않은 날과 이유
         close_stopped = False                 # 예상과 다른 창이 뜨면 그 뒤로는 아무것도 하지 않는다
+        handled: list[tuple[date, list, set]] = []   # 파일 기준으로 다룬 날 — 끝에 같은 창에서 다시 읽어 점검한다
 
         try:
             await page.goto(NEIS_URL)
@@ -1465,17 +1652,25 @@ async def main():
                 if sync:
                     import verify_attendance
                     grid = await verify_attendance.read_grid(page)
+                    # 선생님이 직접 넣을 줄이 아직 비어 있으면 그날은 마감하지 않는다 (❌ 로 알린다)
+                    keep = {n for day, n in SYNC_KEEP if day == d}
+                    waiting = sorted(n for n in keep if not (grid.get(n) or {}).get("마감"))
+                    for n in waiting:
+                        failures.append(_failure(d, FAILED, {"number": n, "name": (grid.get(n) or {}).get("성명", ""),
+                                                             "label": "직접 입력"},
+                                                 "나이스에 직접 넣어 주세요 — 넣기 전에는 그날을 마감하지 않습니다"))
                     if not grid and not tasks:
                         # 10/05·10/09 실측: 「시간표를 확인 하세요」 알림 뒤 표가 0행 — 수업 없는 날로 보인다
                         print("  ⏭  나이스 표가 비어 있고 파일에도 출결이 없습니다 — 건너뜀 (시간표 없는 날?)")
                         continue
+                    handled.append((d, tasks, keep))
                     if not grid:
                         print("  ⚠️  나이스 표를 읽지 못했습니다 — 지우기 없이 파일 것만 넣습니다")
                     else:
-                        to_clear, to_enter = plan_sync(tasks, grid)
+                        to_clear, to_enter = plan_sync(tasks, grid, keep)
                         if not to_clear and not to_enter:
                             print("  ✅  나이스가 이미 파일과 같습니다 — 고칠 것 없음")
-                            if do_close and not await day_is_closed(page):
+                            if do_close and not waiting and not await day_is_closed(page):
                                 ok, why = await close_day(page)
                                 if ok:
                                     closed.append(d)
@@ -1505,7 +1700,7 @@ async def main():
                             day_cols = await read_day_columns(page)
                             grid = await verify_attendance.read_grid(page)
                             if grid:
-                                to_clear, to_enter = plan_sync(tasks, grid)
+                                to_clear, to_enter = plan_sync(tasks, grid, keep)
                         for c in to_clear:
                             again = " → 파일대로 다시 넣음" if any(t["number"] == c["number"] for t in to_enter) else ""
                             print(f"  ✏️   {c['number']}번 {c['name']}: 나이스 '{c['was']}' 지움{again}")
@@ -1536,7 +1731,8 @@ async def main():
                     # 저장 뒤 표를 다시 읽어 파일과 같아졌는지 본다 (못 들어간 학생은 이미 ❌ 로 잡혀 있다)
                     import verify_attendance
                     grid = await verify_attendance.read_grid(page)
-                    left_clear, left_enter = plan_sync(tasks, grid) if grid else ([], [])
+                    left_clear, left_enter = (plan_sync(tasks, grid, {n for day, n in SYNC_KEEP if day == d})
+                                             if grid else ([], []))
                     already = {f["number"] for f in failures if f["date"] == d}
                     for t in [*left_clear, *left_enter]:
                         if t["number"] in already:
@@ -1571,7 +1767,13 @@ async def main():
                         close_stopped = True
                         break
 
+            final_bad = 0
+            if handled and not close_stopped:
+                final_bad = await final_check(page, handled, do_close)
+
             exit_code = report_failures(failures)
+            if final_bad:
+                exit_code = 1
             if do_close or closed or not_closed:   # 마감취소 하고 다시 마감한 날도 여기서 알린다
                 print(f"\n🔒  출결마감: {len(closed)}일 마감 "
                       + (f"({', '.join(x.strftime('%m/%d') for x in closed)})" if closed else ""))
